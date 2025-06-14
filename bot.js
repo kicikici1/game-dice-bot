@@ -1,9 +1,9 @@
 // ===================================================================
-// === PEŁNY SKRYPT BOTA DO GRY W KOŚCI v4.2                       ===
-// === DODANO ZAPIS HISTORII DO PLIKU TXT I PAMIĘCI PRZEGLĄDARKI   ===
+// === PEŁNY SKRYPT BOTA DO GRY W KOŚCI v5.0                       ===
+// === DODANO DASHBOARD ZE STATYSTYKAMI I WYBÓR STRATEGII          ===
 // ===================================================================
 
-console.log("--- Inicjalizacja skryptu bota v4.2 (Fibonacci, Zapis Historii). Użyj przycisków w rogu ekranu. ---");
+console.log("--- Inicjalizacja skryptu bota v5.0 (Dashboard & Multi-Strategy). ---");
 
 // === 1. PARAMETRY BOTA ===
 const initial_bet_unit = 0.01;
@@ -13,6 +13,7 @@ const stop_win = 20;
 const trend_window = 5;
 const delay_between_rolls = 3000;
 const QUIET_MODE = true;
+const paroli_win_streak_limit = 3; // Limit wygranych z rzędu dla strategii Paroli
 
 // === 2. SELEKTORY CSS (bez zmian) ===
 const LAST_ROLL_SELECTOR = 'div.bg-brand_secondary > span';
@@ -21,158 +22,220 @@ const BET_INPUT_SELECTOR = 'input[inputmode="decimal"]';
 const GAME_MODE_TEXT_SELECTOR = 'span.text-secondary.font-semibold:first-of-type';
 const GAME_MODE_SWITCH_BUTTON_SELECTOR = 'span.text-secondary.font-semibold:first-of-type + button';
 
-// === 3. STAN GRY (dodano pełną historię) ===
+// === 3. STAN GRY (rozbudowany) ===
 let balance_start = null, current_bet = initial_bet_unit, wins = 0, losses = 0;
-let history_for_trend = [], last_known_balance; // Zmieniono nazwę, aby było jasne
-let full_history = []; // NOWA: Przechowuje WSZYSTKIE rzuty sesji
+let history_for_trend = [], last_known_balance;
+let full_history_log = [];
 let bot_running = false, bot_interval;
-let ui_play_pause_button, ui_stop_button, ui_download_button;
-let fibonacci_level = 1;
+let ui_play_pause_button, ui_stop_button, ui_download_button, ui_strategy_selector;
+let ui_wins_span, ui_losses_span, ui_profit_span, ui_bet_span;
+// Zmienne strategii
+let currentStrategyName = 'fibonacci'; // Domyślna strategia
+let strategy_level = 1; // Uniwersalny 'poziom' dla strategii (Fibo, d'Alembert, Paroli)
 
-// === 4. FUNKCJE POMOCNICZE (bez zmian) ===
+// === 4. LOGIKA STRATEGII (NOWA, MODUŁOWA STRUKTURA) ===
+const strategies = {
+    'fibonacci': {
+        name: 'Fibonacci',
+        reset: () => { strategy_level = 1; return initial_bet_unit * getFibonacciNumber(strategy_level); },
+        onWin: () => {
+            strategy_level -= 2;
+            if (strategy_level < 1) strategy_level = 1;
+            return initial_bet_unit * getFibonacciNumber(strategy_level);
+        },
+        onLoss: () => {
+            strategy_level++;
+            return initial_bet_unit * getFibonacciNumber(strategy_level);
+        }
+    },
+    'martingale': {
+        name: 'Martingale',
+        reset: () => { strategy_level = 1; return initial_bet_unit; },
+        onWin: () => initial_bet_unit,
+        onLoss: (currentBet) => currentBet * 2
+    },
+    'dalembert': {
+        name: "d'Alembert",
+        reset: () => { strategy_level = 1; return initial_bet_unit; },
+        onWin: () => {
+            strategy_level--;
+            if (strategy_level < 1) strategy_level = 1;
+            return initial_bet_unit * strategy_level;
+        },
+        onLoss: () => {
+            strategy_level++;
+            return initial_bet_unit * strategy_level;
+        }
+    },
+    'paroli': {
+        name: 'Paroli (Anti-Martingale)',
+        reset: () => { strategy_level = 0; return initial_bet_unit; }, // level to licznik wygranych
+        onWin: (currentBet) => {
+            strategy_level++;
+            if (strategy_level >= paroli_win_streak_limit) {
+                strategy_level = 0; // Reset serii
+                return initial_bet_unit;
+            }
+            return currentBet * 2;
+        },
+        onLoss: () => {
+            strategy_level = 0; // Reset serii
+            return initial_bet_unit;
+        }
+    }
+};
+
+// === 5. FUNKCJE POMOCNICZE ===
 function getFibonacciNumber(n) { if (n <= 1) return 1; let a = 1, b = 1, temp; for (let i = 3; i <= n; i++) { temp = a + b; a = b; b = temp; } return b; }
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function findButtonByText(text) { /* ... bez zmian ... */ }
+function findButtonByText(text) { const btns=document.querySelectorAll("button");for(const b of btns)if(b.textContent.trim().toLowerCase().includes(text.toLowerCase())&&b.className.includes("button-brand"))return b;const spans=document.querySelectorAll("button span");for(const s of spans)if(s.textContent.trim().toLowerCase().includes(text.toLowerCase()))return s.closest("button");return null; }
 
-// === 5. FUNKCJE INTERAKCJI ZE STRONĄ (bez zmian) ===
-function getGameState() { /* ... bez zmian ... */ }
-async function setBetAmount(amount) { /* ... bez zmian ... */ }
-async function setGameMode(targetMode) { /* ... bez zmian ... */ }
-async function placeBet() { /* ... bez zmian ... */ }
+// === 6. FUNKCJE INTERAKCJI ZE STRONĄ ===
+function getGameState() { let r=null,b=null,m=null;const lr=document.querySelector(LAST_ROLL_SELECTOR);lr&&(r=parseFloat(lr.textContent.trim()));const be=document.querySelector(BALANCE_SELECTOR);be&&(b=parseFloat(be.textContent.trim().replace(/[^0-9.]/g,"")));const me=document.querySelector(GAME_MODE_TEXT_SELECTOR);return me&&(me.textContent.toLowerCase().includes("over")?m="over":me.textContent.toLowerCase().includes("under")&&(m="under")),{lastRoll:r,balance:b,gameMode:m}; }
+async function setBetAmount(amount) { const i=document.querySelector(BET_INPUT_SELECTOR);if(!i)return!1;const v=amount.toFixed(8),s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,"value").set;s.call(i,v),i.dispatchEvent(new Event("input",{bubbles:!0})),i.dispatchEvent(new Event("change",{bubbles:!0}));if(!QUIET_MODE)console.log(`Wpisano kwotę: ${v}`);await delay(100);return!0; }
+async function setGameMode(targetMode) { const s=getGameState();if(!s.gameMode)return!1;if(s.gameMode!==targetMode){const b=document.querySelector(GAME_MODE_SWITCH_BUTTON_SELECTOR);if(b){b.click();await delay(200);return!0;}}return!0; }
+async function placeBet() { const b=findButtonByText("Roll");if(b&&!b.disabled){b.click();return!0;}stopBot();return!1; }
 
-// === 6. GŁÓWNA LOGIKA BOTA (dodano zapis do historii) ===
+// === 7. GŁÓWNA LOGIKA BOTA (używa obiektu strategii) ===
 async function runBotLogic() {
     if (!bot_running) return;
-    if (!QUIET_MODE) console.log("--- Kolejna iteracja bota (Fibonacci) ---");
     const state = getGameState();
-    
-    // Inicjalizacja...
-    if (balance_start === null && state.balance !== null) { /* ... bez zmian ... */ }
+    const betToPlace = current_bet;
+    const direction = history_for_trend.length >= trend_window ? (history_for_trend.reduce((a, b) => a + b, 0) / history_for_trend.length < 50 ? 'over' : 'under') : 'over';
 
-    // Wykrywanie wyniku...
-    if (state.balance !== null && state.balance !== last_known_balance) { /* ... bez zmian ... */ }
+    if (balance_start === null && state.balance !== null) { balance_start = state.balance; last_known_balance = state.balance; }
 
-    // NOWA SEKCJA: ZAPIS DO HISTORII
-    if (state.lastRoll && (full_history.length === 0 || full_history[full_history.length - 1] !== state.lastRoll)) {
-        full_history.push(state.lastRoll); // Dodaj do pełnej historii
-        history_for_trend.push(state.lastRoll); // Dodaj do historii dla trendu
-        if (history_for_trend.length > trend_window) {
-            history_for_trend.shift(); // Utrzymuj historię dla trendu o stałej długości
+    if (state.balance !== null && state.balance !== last_known_balance) {
+        const profit = state.balance - last_known_balance;
+        const gameResult = profit > 0 ? 'Win' : 'Loss';
+        
+        const logEntry = [full_history_log.length+1, state.lastRoll, betToPlace.toFixed(4), direction.toUpperCase(), gameResult, state.balance.toFixed(4)].join(',');
+        full_history_log.push(logEntry);
+        localStorage.setItem('bc_dice_bot_history_csv', full_history_log.join('\n'));
+        
+        if (gameResult === 'Win') {
+            wins++;
+            current_bet = strategies[currentStrategyName].onWin(current_bet);
+        } else {
+            losses++;
+            current_bet = strategies[currentStrategyName].onLoss(current_bet);
         }
-        // Zapisz pełną historię w pamięci przeglądarki
-        localStorage.setItem('bc_dice_bot_history', JSON.stringify(full_history));
-        if (!QUIET_MODE) console.log(`Zapisano rzut ${state.lastRoll}. Całkowita liczba rzutów: ${full_history.length}`);
+        
+        last_known_balance = state.balance;
+        updateUIStats(); // Aktualizuj statystyki w UI
+        
+        if (state.balance - balance_start >= stop_win) { console.log(`%c📈 STOP WIN`, "color: blue;"); stopBot(); return; }
+        if (state.balance - balance_start <= stop_loss) { console.log(`%c📉 STOP LOSS`, "color: orange;"); stopBot(); return; }
+    }
+    
+    if (state.lastRoll && (history_for_trend.length === 0 || history_for_trend[history_for_trend.length - 1] !== state.lastRoll)) {
+        history_for_trend.push(state.lastRoll);
+        if (history_for_trend.length > trend_window) history_for_trend.shift();
     }
 
-    // Analiza trendu
-    let target_over = true;
-    if (history_for_trend.length >= trend_window) {
-        const avg = history_for_trend.reduce((a, b) => a + b, 0) / history_for_trend.length;
-        target_over = (avg < 50);
-    }
-    const targetMode = target_over ? 'over' : 'under';
-    
-    console.log(`Następny ruch: Stawka=${current_bet.toFixed(4)} (Fibo: ${fibonacci_level}), Kierunek=${targetMode.toUpperCase()}`);
+    console.log(`Następny ruch: Stawka=${current_bet.toFixed(4)}, Kierunek=${direction.toUpperCase()}, Strat: ${currentStrategyName}`);
     
     await setBetAmount(current_bet);
-    await setGameMode(targetMode);
+    await setGameMode(direction);
     await placeBet();
 }
 
-
-// === 7. KONTROLA BOTA (dodano ładowanie historii przy starcie) ===
-function startBot() {
-    if (bot_running) return;
-    
-    // Przy pierwszym uruchomieniu, spróbuj załadować historię z poprzedniej sesji
-    if (full_history.length === 0) {
-        const savedHistory = localStorage.getItem('bc_dice_bot_history');
-        if (savedHistory) {
-            full_history = JSON.parse(savedHistory);
-            console.log(`Załadowano ${full_history.length} rzutów z poprzedniej sesji.`);
-        }
+// === 8. KONTROLA BOTA I UI ===
+function updateUIStats() {
+    if (ui_wins_span) ui_wins_span.textContent = wins;
+    if (ui_losses_span) ui_losses_span.textContent = losses;
+    if (ui_profit_span && last_known_balance !== null) {
+        const profit = last_known_balance - balance_start;
+        ui_profit_span.textContent = profit.toFixed(4);
+        ui_profit_span.style.color = profit >= 0 ? '#4caf50' : '#f44336';
     }
-    
-    bot_running = true;
-    console.log("▶️ Bot uruchomiony/wznowiony.");
-    ui_play_pause_button.textContent = '❚❚';
-    ui_play_pause_button.style.color = '#ffc107';
-    runBotLogic();
-    bot_interval = setInterval(runBotLogic, delay_between_rolls);
+    if (ui_bet_span) ui_bet_span.textContent = current_bet.toFixed(4);
 }
-function pauseBot() { /* ... bez zmian ... */ }
-function stopBot() { /* ... bez zmian ... */ }
-
-// === 8. INTERFEJS UŻYTKOWNIKA (UI) (dodano przycisk pobierania) ===
+function resetBotState() {
+    current_bet = strategies[currentStrategyName].reset();
+    wins = 0;
+    losses = 0;
+    balance_start = last_known_balance; // Reset P/L
+    updateUIStats();
+}
+function startBot() { if(bot_running)return; if(full_history_log.length === 0){ const h = localStorage.getItem('bc_dice_bot_history_csv'); if(h) full_history_log=h.split('\n'); } bot_running = true; ui_play_pause_button.textContent = '❚❚'; ui_strategy_selector.disabled = true; runBotLogic(); bot_interval = setInterval(runBotLogic, delay_between_rolls); }
+function pauseBot() { if(!bot_running)return; bot_running=false; clearInterval(bot_interval); ui_play_pause_button.textContent = '▶️'; ui_strategy_selector.disabled = false; }
+function stopBot() { pauseBot(); ui_play_pause_button.disabled = true; ui_stop_button.disabled = true; ui_download_button.disabled = true; ui_strategy_selector.disabled = true; }
 function createBotUI() {
     const container = document.createElement('div');
-    container.style.position = 'fixed';
-    container.style.top = '10px';
-    container.style.right = '10px';
-    container.style.zIndex = '9999';
-    container.style.display = 'flex';
-    container.style.gap = '8px';
+    container.style.cssText = 'position:fixed; top:10px; right:10px; z-index:9999; background:rgba(40,40,40,0.9); border:1px solid #555; border-radius:8px; color:white; font-family:monospace; padding:10px; display:flex; flex-direction:column; gap:8px;';
 
-    // Przycisk Play/Pause
-    ui_play_pause_button = document.createElement('button');
-    ui_play_pause_button.textContent = '▶️';
-    ui_play_pause_button.onclick = () => { bot_running ? pauseBot() : startBot(); };
+    // Sekcja statystyk
+    const statsContainer = document.createElement('div');
+    statsContainer.style.cssText = 'display:grid; grid-template-columns:1fr 1fr; gap:5px;';
     
-    // Przycisk Stop
-    ui_stop_button = document.createElement('button');
-    ui_stop_button.textContent = 'S';
-    ui_stop_button.onclick = () => { if (confirm("Czy na pewno chcesz ostatecznie zatrzymać bota?")) stopBot(); };
-
-    // NOWY Przycisk Pobierz Historię
-    ui_download_button = document.createElement('button');
-    ui_download_button.innerHTML = '💾'; // Ikona dyskietki
-    ui_download_button.title = 'Pobierz historię rzutów';
-    ui_download_button.onclick = () => {
-        const dataToSave = localStorage.getItem('bc_dice_bot_history');
-        if (!dataToSave || dataToSave === '[]') {
-            alert("Brak historii do zapisania.");
-            return;
-        }
-        const historyArray = JSON.parse(dataToSave);
-        const formattedData = historyArray.join('\n'); // Każdy rzut w nowej linii
-        const blob = new Blob([formattedData], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `dice_history_${new Date().toISOString().slice(0,10)}.txt`; // Nazwa pliku z datą
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        console.log(`Pobrano historię zawierającą ${historyArray.length} rzutów.`);
+    const createStat = (label, id) => {
+        const p = document.createElement('p');
+        p.style.margin = '0';
+        p.innerHTML = `${label}: <span id="${id}">0</span>`;
+        statsContainer.appendChild(p);
+        return document.getElementById(id);
     };
 
-    // Style...
-    [ui_play_pause_button, ui_stop_button, ui_download_button].forEach(button => {
-        button.style.width = '40px';
-        button.style.height = '40px';
-        button.style.backgroundColor = '#333';
-        button.style.color = 'white';
-        button.style.border = '2px solid #555';
-        button.style.borderRadius = '50%';
-        button.style.fontSize = '18px';
-        button.style.fontWeight = 'bold';
-        button.style.cursor = 'pointer';
-        button.style.display = 'flex';
-        button.style.alignItems = 'center';
-        button.style.justifyContent = 'center';
-        container.appendChild(button);
+    ui_wins_span = createStat('W', 'bot-wins');
+    ui_losses_span = createStat('L', 'bot-losses');
+    ui_profit_span = createStat('P/L', 'bot-profit');
+    ui_bet_span = createStat('Bet', 'bot-bet');
+
+    // Sekcja kontrolek
+    const controlsContainer = document.createElement('div');
+    controlsContainer.style.cssText = 'display:flex; gap:8px; align-items:center;';
+
+    ui_play_pause_button = document.createElement('button');
+    ui_stop_button = document.createElement('button');
+    ui_download_button = document.createElement('button');
+    ui_strategy_selector = document.createElement('select');
+
+    // Konfiguracja przycisków
+    ui_play_pause_button.textContent = '▶️';
+    ui_play_pause_button.onclick = () => { bot_running ? pauseBot() : startBot(); };
+    ui_stop_button.textContent = 'S';
+    ui_stop_button.onclick = () => { if (confirm("Zatrzymać bota na stałe?")) stopBot(); };
+    ui_download_button.innerHTML = '💾';
+    ui_download_button.onclick = () => {
+        const data = localStorage.getItem('bc_dice_bot_history_csv'); if(!data)return;
+        const blob = new Blob(["Round,Roll,Bet,Direction,Result,Balance\n" + data], {type:'text/csv;charset=utf-8;'});
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href=url; a.download=`dice_history_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click(); window.URL.revokeObjectURL(url);
+    };
+    
+    // Konfiguracja menu strategii
+    for (const key in strategies) {
+        const option = document.createElement('option');
+        option.value = key;
+        option.textContent = strategies[key].name;
+        ui_strategy_selector.appendChild(option);
+    }
+    ui_strategy_selector.value = currentStrategyName;
+    ui_strategy_selector.onchange = (e) => {
+        currentStrategyName = e.target.value;
+        console.log(`Zmieniono strategię na: ${strategies[currentStrategyName].name}`);
+        resetBotState();
+    };
+    ui_strategy_selector.style.cssText = 'flex-grow:1; background:#555; color:white; border:1px solid #777; border-radius:4px;';
+    
+    [ui_play_pause_button, ui_stop_button, ui_download_button].forEach(b => {
+        b.style.cssText = 'width:35px; height:35px; background:#333; color:white; border:1px solid #555; border-radius:4px; font-size:16px; cursor:pointer;';
     });
     
-    ui_play_pause_button.style.color = '#4caf50';
-    ui_stop_button.style.color = '#f44336';
-    ui_download_button.style.color = '#2196F3'; // Niebieski dla pobierania
+    controlsContainer.appendChild(ui_play_pause_button);
+    controlsContainer.appendChild(ui_stop_button);
+    controlsContainer.appendChild(ui_download_button);
 
+    container.appendChild(statsContainer);
+    container.appendChild(document.createElement('hr'));
+    container.appendChild(ui_strategy_selector);
+    container.appendChild(controlsContainer);
+    
     document.body.appendChild(container);
+    resetBotState(); // Zainicjuj UI
     console.log("UI Bota zostało dodane do strony.");
 }
-
-// Uzupełnienie brakujących funkcji (zminifikowane)
-findButtonByText=t=>{const o=document.querySelectorAll("button");for(const n of o)if(n.textContent.trim().toLowerCase().includes(t.toLowerCase())&&n.className.includes("button-brand"))return n;const e=document.querySelectorAll("button span");for(const n of e)if(n.textContent.trim().toLowerCase().includes(t.toLowerCase()))return n.closest("button");return null},getGameState=()=>{let t=null,o=null,n=null;const e=document.querySelector(LAST_ROLL_SELECTOR);e&&(t=parseFloat(e.textContent.trim()));const c=document.querySelector(BALANCE_SELECTOR);c&&(o=parseFloat(c.textContent.trim().replace(/[^0-9.]/g,"")));const r=document.querySelector(GAME_MODE_TEXT_SELECTOR);return r&&(r.textContent.toLowerCase().includes("over")?n="over":r.textContent.toLowerCase().includes("under")&&(n="under")),{lastRoll:t,balance:o,gameMode:n}},setBetAmount=async t=>{const o=document.querySelector(BET_INPUT_SELECTOR);if(!o)return console.error("Błąd: Nie znaleziono pola wprowadzania kwoty zakładu."),!1;const n=t.toFixed(8),e=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,"value").set;return e.call(o,n),o.dispatchEvent(new Event("input",{bubbles:!0})),o.dispatchEvent(new Event("change",{bubbles:!0})),!QUIET_MODE&&console.log(`Wpisano kwotę: ${n}`),await delay(100),!0},setGameMode=async t=>{const o=getGameState();if(!o.gameMode)return console.error("Nie udało się odczytać aktualnego trybu gry."),!1;if(o.gameMode!==t){!QUIET_MODE&&console.log(`Zmieniam tryb gry z ${o.gameMode} na ${t}...`);const n=document.querySelector(GAME_MODE_SWITCH_BUTTON_SELECTOR);if(n)return n.click(),await delay(200),!0;console.error("Nie znaleziono przycisku do zmiany trybu gry.")}return!0},placeBet=async()=>{!QUIET_MODE&&console.log("Szukam przycisku 'Roll'...");const t=findButtonByText("Roll");return t&&!t.disabled?(!QUIET_MODE&&console.log("Znaleziono przycisk 'Roll', klikam..."),t.click(),!0):(console.error("Nie znaleziono lub przycisk 'Roll' jest nieaktywny."),stopBot(),!1)},pauseBot=()=>{bot_running&&(bot_running=!1,clearInterval(bot_interval),console.log("⏸️ Bot spauzowany."),ui_play_pause_button.textContent="▶️",ui_play_pause_button.style.color="#4caf50")},stopBot=()=>{pauseBot(),console.log("🛑 Bot ostatecznie zatrzymany."),ui_play_pause_button.disabled=!0,ui_stop_button.disabled=!0,ui_download_button&&(ui_download_button.style.opacity=.5)};runBotLogic=async function(){if(!bot_running)return;!QUIET_MODE&&console.log("--- Kolejna iteracja bota (Fibonacci) ---");const t=getGameState();null===balance_start&&null!==t.balance&&(balance_start=t.balance,last_known_balance=t.balance,current_bet=initial_bet_unit*getFibonacciNumber(fibonacci_level),console.log(`Ustawiono początkowe saldo: ${balance_start}. Stawka startowa: ${current_bet.toFixed(4)}`)),null!==t.balance&&t.balance!==last_known_balance&&(t.balance-last_known_balance>0?(wins++,console.log(`%cWYGRANA! Zysk: ${(t.balance-last_known_balance).toFixed(4)}.`, "color: green; font-weight: bold;"),fibonacci_level-=2,fibonacci_level<1&&(fibonacci_level=1),!QUIET_MODE&&console.log(`Cofam poziom Fibonacciego do: ${fibonacci_level}`)):(losses++,console.log(`%cPRZEGRANA. Strata: ${(t.balance-last_known_balance).toFixed(4)}.`, "color: red; font-weight: bold;"),fibonacci_level++,!QUIET_MODE&&console.log(`Zwiększam poziom Fibonacciego do: ${fibonacci_level}`)),current_bet=initial_bet_unit*getFibonacciNumber(fibonacci_level),last_known_balance=t.balance,t.balance-balance_start>=stop_win?(console.log("%c📈 STOP WIN OSIĄGNIĘTY!","color: blue;"),stopBot()):t.balance-balance_start<=stop_loss&&(console.log("%c📉 STOP LOSS OSIĄGNIĘTY!","color: orange;"),stopBot())),t.lastRoll&&(0===full_history.length||full_history[full_history.length-1]!==t.lastRoll)&&(full_history.push(t.lastRoll),history_for_trend.push(t.lastRoll),history_for_trend.length>trend_window&&history_for_trend.shift(),localStorage.setItem("bc_dice_bot_history",JSON.stringify(full_history)),!QUIET_MODE&&console.log(`Zapisano rzut ${t.lastRoll}. Całkowita liczba rzutów: ${full_history.length}`));let o=!0;history_for_trend.length>=trend_window&&(o=history_for_trend.reduce((t,o)=>t+o,0)/history_for_trend.length<50);const n=o?"over":"under";console.log(`Następny ruch: Stawka=${current_bet.toFixed(4)} (Fibo: ${fibonacci_level}), Kierunek=${n.toUpperCase()}`),await setBetAmount(current_bet),await setGameMode(n),await placeBet()};
 
 createBotUI();
